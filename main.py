@@ -3,11 +3,13 @@ import time
 import sys
 import queue
 import threading
-
+import soundfile as sf
+import numpy as np
+import sounddevice as sd
 
 #hardcoded for now, might lead to some problems later
-MIDI_INPUT = 'Launchkey Mini:Launchkey Mini LK Mini MIDI 20:0'
-MIDI_OUTPUT = 'Launchkey Mini:Launchkey Mini LK Mini InContro 20:1' 
+MIDI_INPUT = 'Launchkey Mini:Launchkey Mini LK Mini InContro 16:1'
+MIDI_OUTPUT = 'Launchkey Mini:Launchkey Mini LK Mini InContro 16:1' 
 
 class Launchkey:
     def __init__(self):
@@ -63,9 +65,12 @@ class Sequencer:
         self.lk = Launchkey()
         self.clock_thread = threading.Thread(target=self.clock_loop, daemon=True)
         self.event_thread = threading.Thread(target=self.process_events, daemon=True)
+        self.action_thread = threading.Thread(target=self.parse_inputs, daemon=True)
+        self.action_thread.start()
         self.clock_thread.start()
         self.event_thread.start()
         self.sequencer_leds = [0,1,2,3,4,5,6,7,9,10,11,12,13,14,15,16]
+        
         
 
         self.patterns[0][1] = True 
@@ -74,10 +79,30 @@ class Sequencer:
         self.running = True
         self.update_leds()
 
+    def pad_to_seq(self, x):
+        seq = list(range(8)) + 8*[-1] + list(range(8,16))
+        return seq[x-96]
 
+    def parse_inputs(self):
+        for msg in self.lk.inport:
+            print(msg)
+            if msg.channel == 0 and msg.type == "note_on":
+                #pb ici avec les play button mais flem
+                if msg.note <= 119 and msg.note >= 96:
+                    self.patterns[self.current_pattern][self.pad_to_seq(msg.note)] ^= True
+                    self.update_leds()
+            if msg.channel == 0 and msg.type == "control_change":
+                match msg.control:
+                    case 106:
+                        if self.current_pattern > 0:
+                            self.current_pattern -= 1
+                            self.update_leds()
+                    case 107:
+                        if self.current_pattern < 15:
+                            self.current_pattern += 1
+                            self.update_leds()
 
-
-        
+     
 
     def clock_loop(self):
         step = 60/(self.bpm*4)
