@@ -6,7 +6,7 @@ import threading
 import soundfile as sf
 import numpy as np
 import sounddevice as sd
-import audiotest
+import audio_engine
 import copy
 
 #hardcoded for now, might lead to some problems later
@@ -92,6 +92,8 @@ class Pattern:
         self.current_bar = 0
         self.pattern = [[Note() for _ in range(BAR_LEN)] for _ in range(self.len)]
         self.played_pattern = self.pattern[self.current_bar]
+        self.sample = [0]
+        self.playing = False
     
     def resize(self, new_len):
         assert(new_len > 0)
@@ -132,22 +134,31 @@ class SampleState(State):
         self.update_leds()
 
     def update_leds(self):
-        for i,sample in enumerate(self.engine.samples):
-            if len(sample) > 1:
-                self.lk.led_on(i,1,0)
+        for i,pattern in enumerate(self.engine.patterns):
+            if len(pattern.sample) > 1:
+                if self.engine:
+                    if self.engine.patterns[i].playing:
+                        self.lk.led_on(i,1,0)
+                    else:
+                        self.lk.led_on(i,1,1)
             else:
                 self.lk.led_off(i)
             if self.engine.running == False:
                 self.lk.led_off(16)
     def on_tick(self):
         for i in range(16):
-            if len(self.engine.samples[i]) > 1 and self.engine.patterns[i].played_pattern[self.engine.current_step].on:
-                self.lk.rev_blink_led(i,1,0,0.03)
+            if len(self.engine.patterns[i].sample) > 1 and self.engine.patterns[i].played_pattern[self.engine.current_step].on:
+                if self.engine.patterns[i].playing:
+                    self.lk.rev_blink_led(i,1,0,0.03)
         if self.engine.current_step % 24 == 0:
             self.lk.rev_blink_led(16,1,0,0.05)
     def on_pad(self, pad, velocity):
-        if pad < 16 and len(engine.samples[pad]) > 1:
-            self.machine.transition(SequencerState(self.machine, pad))
+        if pad < 16 and len(engine.patterns[pad].sample) > 1:
+            if lk.pad_held[17]:
+                self.machine.transition(SequencerState(self.machine, pad))
+            else:
+                self.engine.patterns[pad].playing ^= True
+                self.update_leds()
         elif pad == 16:
             self.engine.running ^= True
             self.update_leds()
@@ -173,8 +184,11 @@ class SequencerState(State):
                     self.lk.led_off(i//self.division)
 
     def on_pad(self, pad, velocity):
-        if pad*self.division < 96:
+        if pad < 16 :
             self.engine.patterns[self.current_pattern].pattern[self.current_bar][pad*self.division].on ^= True
+            self.update_leds()
+        elif pad == 16:
+            self.engine.running ^= True
             self.update_leds()
     
     def on_tick(self):
@@ -183,11 +197,14 @@ class SequencerState(State):
         nb_notes = 96//self.division
         if self.current_bar == self.engine.patterns[self.current_pattern].current_bar:
             if step % self.division == 0:
-                if self.engine.patterns[self.current_pattern].pattern[(step-self.division)%96].on == False:
+                print(len(self.engine.patterns[self.current_pattern].pattern))
+                if self.engine.patterns[self.current_pattern].played_pattern[(step-self.division)%96].on == False:
                     self.lk.led_off((visual_step-1)%nb_notes)
                 else:
                     self.lk.led_on((visual_step-1)%nb_notes,1,1)
                 self.lk.led_on(visual_step,1,0)
+        if self.engine.current_step % 24 == 0:
+            self.lk.rev_blink_led(16,1,0,0.05)
 
     def on_control(self,control):
         match control:
@@ -238,7 +255,7 @@ class StateMachine:
             msg = self.lk.events.get()
             print(msg)
             match msg.type:
-                case "note_on" if msg.channel == 0 and msg.note > 90:
+                case "note_off" if msg.channel == 0 and msg.note > 90:
                     self.current.on_pad(self.pad_to_seq(msg.note),msg.velocity)
                 case "control_change":
                     if msg.value == 127 and msg.control in [104,105,106,107]:
@@ -253,7 +270,9 @@ class Engine:
         self.running = False
         self.bpm = 110
         self.patterns = [Pattern(1) for _ in range(16)]
-        self.samples = [audiotest.kick,audiotest.hihat,audiotest.clap,audiotest.hihat] + 13 * [[0]]
+        self.patterns[0].sample = audio_engine.kick 
+        self.patterns[1].sample = audio_engine.hihat 
+        self.patterns[2].sample = audio_engine.clap
         self.current_step = 0
         self.tick = threading.Event()
         self.play_queue = queue.Queue()
@@ -263,17 +282,18 @@ class Engine:
         self.sample_thread.start()
         self.clock_thread.start()
         
-        audiotest.stream.start()
+        audio_engine.stream.start()
     
     def sample_thread(self):
         while True:
             self.play_queue.get()
             if self.current_step == 0:
                 for i in range(16):
-                    self.patterns[i].next_bar()
+                    if self.patterns[i].playing:
+                        self.patterns[i].next_bar()
             for i in range(16):
-                if self.patterns[i].played_pattern[self.current_step].on == True:
-                    audiotest.play_sample(self.samples[i])
+                if self.patterns[i].played_pattern[self.current_step].on == True and self.patterns[i].playing:
+                    audio_engine.play_sample(self.patterns[i].sample)
 
     def clock_loop(self):
         eps = 0.000001
