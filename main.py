@@ -7,12 +7,13 @@ import soundfile as sf
 import numpy as np
 import sounddevice as sd
 import audiotest
+import copy
 
 #hardcoded for now, might lead to some problems later
 MIDI_INPUT = 'Launchkey Mini:Launchkey Mini LK Mini InContro 20:1'
 MIDI_OUTPUT = 'Launchkey Mini:Launchkey Mini LK Mini InContro 20:1' 
 PPQN = 24
-
+BAR_LEN = PPQN * 4
 class Launchkey:
     def __init__(self):
 
@@ -29,13 +30,23 @@ class Launchkey:
         self.events = queue.Queue()
         self.event_thread = threading.Thread(target=self.fetch_events, daemon=True)
         self.event_thread.start()
+        self.pad_held = [False for _ in range(18)]
 
 
-        #colors are values between 0 and 3 ty partsnotincluded.com
-        # there is 18 leds, the last 2 are play buttons
+    def pad_to_seq(self, x):
+        seq = list(range(8)) + [16] + 7*[-1] + list(range(8,16)) + [17]
+        return seq[x-96]
     def fetch_events(self):
         for msg in self.inport:
             self.events.put(msg)
+            if msg.type in ["note_on", "note_off"]:
+                if msg.note <= 120 and msg.note >= 96:
+                    if msg.type == "note_on":
+                        self.pad_held[self.pad_to_seq(msg.note)] = True
+                    else:
+                        self.pad_held[self.pad_to_seq(msg.note)] = False
+        #colors are values between 0 and 3 ty partsnotincluded.com
+        # there is 18 leds, the last 2 are play buttons
     def led_on(self, led,red,green):
         leds = list(range(8)) + list(range(16,24)) + [8,24]
         self.outport.send(mido.Message('note_on', channel = 0, note = (96 + leds[led]),velocity = (red + (green << 4)) ))
@@ -60,6 +71,7 @@ class Launchkey:
             self.led_off(i)
             time.sleep(0.01)
     
+
     def disconnect(self):
         self.boot_anim()
         stop_incontrol = mido.Message('note_on', note= 12, channel=0, velocity = 0)
@@ -69,7 +81,38 @@ class Launchkey:
         self.outport.close()
         self.inport.close()
         print("everything is done")
+class Note():
+    def __init__(self):
+        self.on = False
+        self.vel = 127
+        self.pitch = 0
+class Pattern:
+    def __init__(self,len):
+        self.len = len
+        self.current_bar = 0
+        self.pattern = [[Note() for _ in range(BAR_LEN)] for _ in range(self.len)]
+        self.played_pattern = self.pattern[self.current_bar]
+    
+    def resize(self, new_len):
+        assert(new_len > 0)
+        if new_len < self.len:
+            if self.current_bar >= new_len:
+                self.current_bar = 0
+        else:
+            self.pattern = [copy.deepcopy(row) for _ in range(new_len//self.len + 1) for row in self.pattern]
+        self.len = new_len
+        self.pattern = self.pattern[:new_len]
+        self.played_pattern = self.pattern[self.current_bar]
+    def resize_relative(self, change):
+        if self.len + change > 0:
+            self.resize(self.len+change)
 
+    def next_bar(self):
+        self.current_bar = (self.current_bar + 1) % self.len
+        self.played_pattern = self.pattern[self.current_bar]
+    def reset_bar(self):
+        self.current_bar =  0
+        self.played_pattern = self.pattern[self.current_bar]
 
 class State:
     def __init__(self, machine):
@@ -90,7 +133,6 @@ class SampleState(State):
 
     def update_leds(self):
         for i,sample in enumerate(self.engine.samples):
-            print(sample)
             if len(sample) > 1:
                 self.lk.led_on(i,1,0)
             else:
@@ -99,7 +141,7 @@ class SampleState(State):
                 self.lk.led_off(16)
     def on_tick(self):
         for i in range(16):
-            if len(self.engine.samples[i]) > 1 and self.engine.patterns[i][self.engine.current_step]:
+            if len(self.engine.samples[i]) > 1 and self.engine.patterns[i].played_pattern[self.engine.current_step].on:
                 self.lk.rev_blink_led(i,1,0,0.03)
         if self.engine.current_step % 24 == 0:
             self.lk.rev_blink_led(16,1,0,0.05)
@@ -115,52 +157,56 @@ class SampleState(State):
 class SequencerState(State):
     def __init__(self, machine, pattern):
         super().__init__(machine)
-        self.division = 8
+        self.division = 6
         self.current_pattern = pattern
+        self.current_bar = 0 
 
 
         self.update_leds()
     
     def update_leds(self):
-        for i,led in enumerate(self.engine.patterns[self.current_pattern]):
+        for i,led in enumerate(self.engine.patterns[self.current_pattern].pattern[self.current_bar]):
             if i % self.division == 0:
-                print(i,i//self.division)
-                if led:
+                if led.on:
                     self.lk.led_on(i//self.division,1,1)
                 else:
                     self.lk.led_off(i//self.division)
 
     def on_pad(self, pad, velocity):
         if pad*self.division < 96:
-            self.engine.patterns[self.current_pattern][pad*self.division] ^= True
+            self.engine.patterns[self.current_pattern].pattern[self.current_bar][pad*self.division].on ^= True
             self.update_leds()
     
     def on_tick(self):
         step = self.engine.current_step
         visual_step = step//self.division
         nb_notes = 96//self.division
-        if step % self.division == 0:
-            if self.engine.patterns[self.current_pattern][(step-self.division)%96] == False:
-                self.lk.led_off((visual_step-1)%nb_notes)
-            else:
-                self.lk.led_on((visual_step-1)%nb_notes,1,1)
-            self.lk.led_on(visual_step,1,0)
+        if self.current_bar == self.engine.patterns[self.current_pattern].current_bar:
+            if step % self.division == 0:
+                if self.engine.patterns[self.current_pattern].pattern[(step-self.division)%96].on == False:
+                    self.lk.led_off((visual_step-1)%nb_notes)
+                else:
+                    self.lk.led_on((visual_step-1)%nb_notes,1,1)
+                self.lk.led_on(visual_step,1,0)
 
     def on_control(self,control):
         match control:
             case 104:
-                print("lmsqkdf")
                 self.machine.transition(SampleState(self.machine))
             case 106:
-                if self.current_pattern > 0:
-                    self.current_pattern -= 1
+                if self.lk.pad_held[17]:
+                    self.engine.patterns[self.current_pattern].resize_relative(-1)
+                if self.current_bar > 0:
+                    self.current_bar -= 1
                     self.update_leds()
-                    print(self.current_pattern)
+                    print(f"current bar : {self.current_bar}")
             case 107:
-                if self.current_pattern < 15:
-                    self.current_pattern += 1
+                if self.lk.pad_held[17]:
+                    self.engine.patterns[self.current_pattern].resize_relative(1)
+                if self.current_bar + 1< self.engine.patterns[self.current_pattern].len:
+                    self.current_bar += 1
                     self.update_leds()
-                    print(self.current_pattern)
+                    print(f" current bar: {self.current_bar}")
 
 
 class StateMachine:
@@ -206,7 +252,7 @@ class Engine:
     def __init__(self):
         self.running = False
         self.bpm = 110
-        self.patterns = [[False for _ in range(96)] for _ in range(16)]
+        self.patterns = [Pattern(1) for _ in range(16)]
         self.samples = [audiotest.kick,audiotest.hihat,audiotest.clap,audiotest.hihat] + 13 * [[0]]
         self.current_step = 0
         self.tick = threading.Event()
@@ -222,8 +268,11 @@ class Engine:
     def sample_thread(self):
         while True:
             self.play_queue.get()
+            if self.current_step == 0:
+                for i in range(16):
+                    self.patterns[i].next_bar()
             for i in range(16):
-                if self.patterns[i][self.current_step] == True:
+                if self.patterns[i].played_pattern[self.current_step].on == True:
                     audiotest.play_sample(self.samples[i])
 
     def clock_loop(self):
@@ -235,10 +284,15 @@ class Engine:
                 self.current_step = (self.current_step + 1) % 96
                 self.tick.set()
                 self.play_queue.put("tick")
+    
 
-            next_time += step
-            while time.perf_counter() < next_time:
-                time.sleep(next_time -time.perf_counter())
+                next_time += step
+                while time.perf_counter() < next_time:
+                    time.sleep(next_time -time.perf_counter())
+            else:
+                self.current_step = 0
+                time.sleep(0.05)
+
 
     
                 
