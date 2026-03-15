@@ -5,7 +5,7 @@ from queue import Queue
 
 # Load a sample
 
-BUFFER_SIZE = 2048
+BUFFER_SIZE = 256
 SR = 44100
 pending = Queue()
 

@@ -9,8 +9,9 @@ import sounddevice as sd
 import audiotest
 
 #hardcoded for now, might lead to some problems later
-MIDI_INPUT = 'Launchkey Mini:Launchkey Mini LK Mini InContro 16:1'
-MIDI_OUTPUT = 'Launchkey Mini:Launchkey Mini LK Mini InContro 16:1' 
+MIDI_INPUT = 'Launchkey Mini:Launchkey Mini LK Mini InContro 20:1'
+MIDI_OUTPUT = 'Launchkey Mini:Launchkey Mini LK Mini InContro 20:1' 
+PPQN = 24
 
 class Launchkey:
     def __init__(self):
@@ -42,14 +43,22 @@ class Launchkey:
     def led_off(self, led):
         leds = list(range(8)) + list(range(16,24)) + [8,24]
         self.outport.send(mido.Message('note_on', channel = 0, note = (96 + leds[led]),velocity = 0 ))
+    
+    def _rev_blink_led_worker(self, led, red, green, t):
+        self.led_off(led)
+        time.sleep(t)
+        self.led_on(led, red, green)
 
+    def rev_blink_led(self, led, red, green, time):
+        thread = threading.Thread(target=self._rev_blink_led_worker, daemon=True, args = (led,red,green,time))
+        thread.start()
     def boot_anim(self):
         for i in range(18):
             self.led_on(i,1,1)
-            time.sleep(0.05)
+            time.sleep(0.01)
         for i in range(18):
             self.led_off(i)
-            time.sleep(0.05)
+            time.sleep(0.01)
     
     def disconnect(self):
         self.boot_anim()
@@ -74,42 +83,84 @@ class State:
     def on_tick(self): pass
     def update_leds(self): pass
 
-class SequencerState(State):
+class SampleState(State):
     def __init__(self, machine):
         super().__init__(machine)
         self.update_leds()
-    
+
     def update_leds(self):
-        for i,led in enumerate(self.engine.patterns[self.engine.current_pattern]):
-            if led:
-                self.lk.led_on(i,1,1)
+        for i,sample in enumerate(self.engine.samples):
+            print(sample)
+            if len(sample) > 1:
+                self.lk.led_on(i,1,0)
             else:
                 self.lk.led_off(i)
+            if self.engine.running == False:
+                self.lk.led_off(16)
+    def on_tick(self):
+        for i in range(16):
+            if len(self.engine.samples[i]) > 1 and self.engine.patterns[i][self.engine.current_step]:
+                self.lk.rev_blink_led(i,1,0,0.03)
+        if self.engine.current_step % 24 == 0:
+            self.lk.rev_blink_led(16,1,0,0.05)
+    def on_pad(self, pad, velocity):
+        if pad < 16 and len(engine.samples[pad]) > 1:
+            self.machine.transition(SequencerState(self.machine, pad))
+        elif pad == 16:
+            self.engine.running ^= True
+            self.update_leds()
+            
+
+
+class SequencerState(State):
+    def __init__(self, machine, pattern):
+        super().__init__(machine)
+        self.division = 8
+        self.current_pattern = pattern
+
+
+        self.update_leds()
+    
+    def update_leds(self):
+        for i,led in enumerate(self.engine.patterns[self.current_pattern]):
+            if i % self.division == 0:
+                print(i,i//self.division)
+                if led:
+                    self.lk.led_on(i//self.division,1,1)
+                else:
+                    self.lk.led_off(i//self.division)
 
     def on_pad(self, pad, velocity):
-        self.engine.patterns[self.engine.current_pattern][pad] ^= True
-        self.update_leds()
+        if pad*self.division < 96:
+            self.engine.patterns[self.current_pattern][pad*self.division] ^= True
+            self.update_leds()
     
     def on_tick(self):
         step = self.engine.current_step
-        if self.engine.patterns[self.engine.current_pattern][(step-1)%16] == False:
-            self.lk.led_off((step-1)%16)
-        else:
-            self.lk.led_on((step-1)%16,1,1)
-        self.lk.led_on(step,1,0)
+        visual_step = step//self.division
+        nb_notes = 96//self.division
+        if step % self.division == 0:
+            if self.engine.patterns[self.current_pattern][(step-self.division)%96] == False:
+                self.lk.led_off((visual_step-1)%nb_notes)
+            else:
+                self.lk.led_on((visual_step-1)%nb_notes,1,1)
+            self.lk.led_on(visual_step,1,0)
 
     def on_control(self,control):
         match control:
+            case 104:
+                print("lmsqkdf")
+                self.machine.transition(SampleState(self.machine))
             case 106:
-                if self.engine.current_pattern > 0:
-                    self.engine.current_pattern -= 1
+                if self.current_pattern > 0:
+                    self.current_pattern -= 1
                     self.update_leds()
-                    print(self.engine.current_pattern)
+                    print(self.current_pattern)
             case 107:
-                if self.engine.current_pattern < 15:
-                    self.engine.current_pattern += 1
+                if self.current_pattern < 15:
+                    self.current_pattern += 1
                     self.update_leds()
-                    print(self.engine.current_pattern)
+                    print(self.current_pattern)
 
 
 class StateMachine:
@@ -117,14 +168,14 @@ class StateMachine:
     def __init__(self, lk, engine):
         self.engine = engine
         self.lk = lk
-        self.current = SequencerState(self)
+        self.current = SampleState(self)
         self.dispatch_thread = threading.Thread(target=self.dispatch, daemon=True)
         self.event_thread = threading.Thread(target=self.manage_events, daemon=True)
         self.dispatch_thread.start()
         self.event_thread.start()
 
     def transition(self, new_state: State):
-        self.current.on_exit()
+        print("switching to new state")
         self.current = new_state
     
     def pad_to_seq(self, x):
@@ -144,7 +195,7 @@ class StateMachine:
                 case "note_on" if msg.channel == 0 and msg.note > 90:
                     self.current.on_pad(self.pad_to_seq(msg.note),msg.velocity)
                 case "control_change":
-                    if msg.value == 127 and msg.control in [106,107,108,109]:
+                    if msg.value == 127 and msg.control in [104,105,106,107]:
                         self.current.on_control(msg.control)
                     else :
                         self.current.on_pot(msg.control, msg.value)
@@ -155,38 +206,39 @@ class Engine:
     def __init__(self):
         self.running = False
         self.bpm = 110
-        self.patterns = [[False for _ in range(16)] for _ in range(16)]
-        self.samples = [audiotest.kick,audiotest.hihat,audiotest.clap,audiotest.hihat,[0,0]]
-        self.current_pattern = 0
+        self.patterns = [[False for _ in range(96)] for _ in range(16)]
+        self.samples = [audiotest.kick,audiotest.hihat,audiotest.clap,audiotest.hihat] + 13 * [[0]]
         self.current_step = 0
         self.tick = threading.Event()
+        self.play_queue = queue.Queue()
         self.clock_thread = threading.Thread(target=self.clock_loop, daemon=True)
         self.sample_thread = threading.Thread(target=self.sample_thread, daemon=True)
+
         self.sample_thread.start()
         self.clock_thread.start()
-        self.running = True
         
         audiotest.stream.start()
     
     def sample_thread(self):
         while True:
-            self.tick.wait()
+            self.play_queue.get()
             for i in range(16):
                 if self.patterns[i][self.current_step] == True:
                     audiotest.play_sample(self.samples[i])
-                    time.sleep(0.001)
 
     def clock_loop(self):
-        step = 60/(self.bpm*4)
+        eps = 0.000001
+        step = 60/(self.bpm*24)
         next_time = time.perf_counter()    
         while True:
             if self.running:
-                self.current_step = (self.current_step + 1) % 16
+                self.current_step = (self.current_step + 1) % 96
                 self.tick.set()
+                self.play_queue.put("tick")
 
             next_time += step
             while time.perf_counter() < next_time:
-                time.sleep(0.000001)
+                time.sleep(next_time -time.perf_counter())
 
     
                 
